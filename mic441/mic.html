@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<meta name="theme-color" content="#0d1117">
+<title>双 INMP441 立体声</title>
+<style>
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin:0; padding:0; min-height:100%; background:#0d1117; color:#e6edf3;
+    font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif; user-select:none; }
+  #app { display:flex; flex-direction:column; height:100vh; padding:12px; gap:10px; }
+  header { display:flex; align-items:center; justify-content:space-between; font-size:14px; color:#8b949e; }
+  #dot { display:inline-block; width:10px; height:10px; border-radius:50%; background:#f85149; margin-right:7px; }
+  #dot.on { background:#3fb950; }
+  #dot.warn { background:#d29922; }
+  #waveWrap { position:relative; background:#161b22; border:1px solid #21262d; border-radius:12px; overflow:hidden; }
+  #wave { display:block; width:100%; height:200px; }
+  .lv { display:flex; align-items:center; gap:8px; font-size:12px; color:#8b949e; }
+  .lv b { width:14px; font-weight:600; }
+  .lv .track { flex:1; height:8px; background:#21262d; border-radius:4px; overflow:hidden; }
+  .lv .track i { display:block; height:100%; width:0; border-radius:4px; transition:width .08s linear; }
+  #lbar { background:#2f81f7; }
+  #rbar { background:#3fb950; }
+  #nums { display:flex; gap:8px; }
+  .card { flex:1; background:#161b22; border:1px solid #21262d; border-radius:12px; padding:9px 10px; text-align:center; }
+  .lbl { font-size:12px; color:#8b949e; letter-spacing:.5px; }
+  .val { font-size:20px; font-weight:600; font-variant-numeric:tabular-nums; line-height:1.3; }
+  .val small { font-size:12px; color:#8b949e; font-weight:400; }
+  #btns, #btns2 { display:flex; gap:8px; }
+  button { flex:1; padding:15px 6px; font-size:16px; border-radius:12px; border:1px solid #30363d;
+           background:#21262d; color:#e6edf3; font-weight:500; }
+  button:active { background:#30363d; }
+  button.pri { background:#238636; border-color:#2ea043; }
+  button.pri:active { background:#2ea043; }
+  button:disabled { opacity:.45; }
+  #log { font-size:12px; color:#8b949e; font-family:ui-monospace,Menlo,monospace;
+         background:#0d1117; border:1px solid #21262d; border-radius:8px; padding:8px;
+         flex:1 1 auto; min-height:80px; overflow-y:auto; white-space:pre-wrap; line-height:1.45; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <span><span id="dot"></span><span id="stat">未开始</span></span>
+    <span><span id="fps">--</span> · <span id="host">--</span></span>
+  </header>
+
+  <div id="waveWrap"><canvas id="wave"></canvas></div>
+
+  <div class="lv"><b style="color:#2f81f7">L</b><div class="track"><i id="lbar"></i></div><span id="ldb">--</span></div>
+  <div class="lv"><b style="color:#3fb950">R</b><div class="track"><i id="rbar"></i></div><span id="rdb">--</span></div>
+
+  <div id="nums">
+    <div class="card"><div class="lbl">采样率</div><div class="val"><span id="sps">--</span><small> Hz</small></div></div>
+    <div class="card"><div class="lbl">实际速率</div><div class="val"><span id="kbs">0</span><small> KB/s</small></div></div>
+    <div class="card"><div class="lbl">声像</div><div class="val" id="pan">--</div></div>
+  </div>
+
+  <div id="btns">
+    <button id="go" class="pri">▶ 实时监听</button>
+    <button id="stop" disabled>■ 停止</button>
+  </div>
+  <div id="btns2">
+    <button id="rec">⏺ 录 3 秒并播放</button>
+  </div>
+  <div class="lv"><b>音量</b><input id="vol" type="range" min="0" max="120" value="60" style="flex:1"><span id="volv">60%</span></div>
+
+  <div id="log"></div>
+</div>
+
+<script>
+const BUILD = "v16k-1";    // 改页面就改这里，方便确认浏览器拿到的是新版
+let RATE = 48000;          // 实际以板子返回的 X-Rate 为准
+const PK_BINS = 600;
+const WAVE_DB_RANGE = 60;      // 波形显示动态范围（dB）：-60dBFS 到底，安静房间也看得见起伏
+let wavePeak = 0.01;           // 近期峰值（线性），用于自适应顶端
+
+const $ = (id) => document.getElementById(id);
+const dot = $('dot'), stat = $('stat'), logEl = $('log');
+
+let ac = null, gain = null, srcRunning = false, ctrl = null, nextT = 0, nch = 2;
+let lastDom = 0, overSince = 0, overWarn = false;
+let bytes = 0, t0 = 0, underruns = 0, lastUnder = 0, lastSignal = 0;
+const envL = new Float32Array(PK_BINS), envR = new Float32Array(PK_BINS);
+let envPos = 0;
+let envA = new Float32Array(512), envB = new Float32Array(512);
+
+function log(msg) {
+  const t = new Date().toLocaleTimeString('zh-CN', {hour12:false});
+  logEl.textContent += `[${t}] ${msg}\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+/* ---------- 波形 ---------- */
+const cvs = $('wave'), ctx = cvs.getContext('2d');
+function fitCanvas() {
+  const r = cvs.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  cvs.width = Math.max(1, Math.round(r.width * dpr));
+  cvs.height = Math.max(1, Math.round(r.height * dpr));
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+window.addEventListener('resize', fitCanvas);
+
+let lastDraw = 0, fpsFrames = 0, fpsT0 = 0;
+
+function draw(ts) {
+  requestAnimationFrame(draw);
+  if (!ts) ts = performance.now();
+  if (ts - lastDraw < 33) return;        // 限 30fps：老手机上帧率比画面细腻更重要
+  lastDraw = ts;
+
+  // fps 统计
+  fpsFrames++;
+  if (!fpsT0) fpsT0 = ts;
+  if (ts - fpsT0 >= 1000) {
+    $('fps').textContent = Math.round(fpsFrames * 1000 / (ts - fpsT0)) + ' fps';
+    fpsFrames = 0; fpsT0 = ts;
+  }
+
+  const w = cvs.clientWidth, h = cvs.clientHeight, mid = h / 2, amp = h / 2 - 2;
+
+  // 自适应刻度：顶端跟着最近的峰值走（升快降慢），这样安静房间也能看见起伏；
+  // 真实电平仍看右侧 dB 数字和电平条，它们不受这里影响。
+  let mx = 0;
+  for (let i = 0; i < PK_BINS; i++) {
+    const v = envL[i] > envR[i] ? envL[i] : envR[i];
+    if (v > mx) mx = v;
+  }
+  wavePeak = mx > wavePeak ? mx : wavePeak * 0.985;
+  if (wavePeak < 1e-5) wavePeak = 1e-5;
+  let topDb = 20 * Math.log10(wavePeak) + 6;
+  if (topDb < 0) topDb = 0;               // 平常固定 0dBFS 顶端，底噪不会被放大成一块
+  const floorDb = topDb - WAVE_DB_RANGE;  // 底部随之 = -42dB
+
+  ctx.clearRect(0, 0, w, h);
+  ctx.strokeStyle = '#21262d'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(0, mid); ctx.lineTo(w, mid); ctx.stroke();
+
+  // 按像素列取包络最大值，一条路径填一个声道（比逐柱 fillRect 快一个数量级）
+  const px = Math.max(1, Math.min(w | 0, 900));
+  const step = PK_BINS / px;
+  for (let c = 0; c < 2; c++) {
+    const env = c ? envR : envL;
+    ctx.beginPath();
+    ctx.moveTo(0, mid);
+    for (let i = 0; i < px; i++) {
+      let m = 0;
+      const from = (i * step) | 0, to = Math.min(PK_BINS, ((i + 1) * step) | 0);
+      for (let k = from; k < to; k++) {
+        const v = env[(envPos + k) % PK_BINS];
+        if (v > m) m = v;
+      }
+      // 用 dB 刻度画（-60dBFS ~ 0dBFS -> 0~1）：
+      // 线性幅度下正常说话只有 1~2 个像素高，肉眼等于没有；dB 刻度才看得见起伏
+      let nv = 0;
+      if (m > 0) {
+        nv = (20 * Math.log10(m) - floorDb) / WAVE_DB_RANGE;
+        if (nv < 0) nv = 0; else if (nv > 1) nv = 1;
+      }
+      const x = i * (w / px);
+      const bh = nv * amp;
+      ctx.lineTo(x, c ? mid + bh : mid - bh);
+    }
+    ctx.lineTo(w, mid);
+    ctx.closePath();
+    ctx.fillStyle = c ? 'rgba(63,185,80,.75)' : 'rgba(47,129,247,.75)';
+    ctx.fill();
+  }
+}
+
+function pushEnv(a, b, n) {
+  const seg = Math.max(1, Math.floor(n / 4));
+  for (let s = 0; s < 4; s++) {
+    const from = s*seg, to = Math.min(n, (s+1)*seg);
+    let pl = 0, pr = 0;
+    for (let i = from; i < to; i++) { if (a[i] > pl) pl = a[i]; if (b[i] > pr) pr = b[i]; }
+    envL[envPos] = pl; envR[envPos] = pr;
+    envPos = (envPos + 1) % PK_BINS;
+  }
+}
+
+/* ---------- 音频 ---------- */
+function audioCtx() {
+  if (ac) return ac;
+  try { ac = new AudioContext({sampleRate: RATE}); }
+  catch (e) { ac = new AudioContext(); }
+  gain = ac.createGain();
+  gain.gain.value = $('vol').value / 100;    // 默认 0.6：开着音箱也不容易自激啸叫
+  gain.connect(ac.destination);
+  $('vol').oninput = () => {
+    gain.gain.value = $('vol').value / 100;
+    $('volv').textContent = $('vol').value + '%';
+  };
+  return ac;
+}
+
+function playChunk(view) {
+  const frameBytes = 2 * nch;
+  const n = Math.floor(view.byteLength / frameBytes);
+  if (!n) return;
+  const dv = new DataView(view.buffer, view.byteOffset, view.byteLength);
+  const buf = ac.createBuffer(nch, n, RATE);
+  const c0 = buf.getChannelData(0);
+  const c1 = nch > 1 ? buf.getChannelData(1) : null;
+  if (envA.length < n) { envA = new Float32Array(n); envB = new Float32Array(n); }
+  const al = envA, ar = envB;
+  let pkL = 0, pkR = 0, ssL = 0, ssR = 0;
+  for (let i = 0; i < n; i++) {
+    const l = dv.getInt16(i * frameBytes, true);
+    c0[i] = l / 32768; al[i] = Math.abs(l) / 32768;
+    ssL += l * l; if (Math.abs(l) > pkL) pkL = Math.abs(l);
+    if (c1) {
+      const r = dv.getInt16(i * frameBytes + 2, true);
+      c1[i] = r / 32768; ar[i] = Math.abs(r) / 32768;
+      ssR += r * r; if (Math.abs(r) > pkR) pkR = Math.abs(r);
+    }
+  }
+  const rmsL = Math.sqrt(ssL / n), rmsR = c1 ? Math.sqrt(ssR / n) : rmsL;
+  if (rmsL > 3 || rmsR > 3) lastSignal = performance.now();
+  // 持续接近满量程 = 多半是"音箱放出来的声音又被麦收进去"的正反馈
+  if (pkL > 30000 || pkR > 30000) {
+    if (!overSince) overSince = performance.now();
+    if (performance.now() - overSince > 600) overWarn = true;
+  } else {
+    overSince = 0; overWarn = false;
+  }
+
+  const now = ac.currentTime;
+  if (nextT < now + 0.02) {
+    if (now - lastUnder > 0.3) { underruns++; lastUnder = now; }
+    nextT = now + 0.08;
+  }
+  const s = ac.createBufferSource();
+  s.buffer = buf; s.connect(gain); s.start(nextT);
+  nextT += buf.duration;
+
+  pushEnv(al, ar, n);
+
+  const dbL = 20 * Math.log10(Math.max(pkL, 1) / 32768);
+  const dbR = 20 * Math.log10(Math.max(pkR, 1) / 32768);
+  // 电平/DOM 每 100ms 才更新一次（每块都写 DOM 会引起布局抖动）
+  const nowMs = performance.now();
+  if (nowMs - lastDom >= 100) {
+    lastDom = nowMs;
+    $('ldb').textContent = dbL.toFixed(0) + ' dB';
+    $('rdb').textContent = dbR.toFixed(0) + ' dB';
+    $('lbar').style.width = Math.min(100, Math.max(0, (dbL + 60) / 60 * 100)) + '%';
+    $('rbar').style.width = Math.min(100, Math.max(0, (dbR + 60) / 60 * 100)) + '%';
+  }
+
+  if (rmsL > 3 || rmsR > 3) {
+    const tot = rmsL + rmsR || 1;
+    const p = (rmsR - rmsL) / tot;           // -1 全左, +1 全右
+    $('pan').textContent = Math.abs(p) < 0.08 ? '中间'
+      : (p < 0 ? '偏左 ' + Math.round(-p * 100) + '%' : '偏右 ' + Math.round(p * 100) + '%');
+  }
+}
+
+/* ---------- 实时流 ---------- */
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function runOnce() {
+  const res = await fetch('/stream?t=' + Date.now(), {signal: ctrl.signal, cache: 'no-store'});
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  if (!res.body || !res.body.getReader) throw new Error('浏览器不支持流式读取');
+  nch = parseInt(res.headers.get('X-Channels') || '2', 10);
+  // 必须跟着板子报的采样率解码：写死或丢掉这一行，32k 的流会被当 48k 播 -> 变慢、音调低
+  RATE = parseInt(res.headers.get('X-Rate') || RATE, 10);
+  stat.textContent = '接收中';
+  log(`已连接：${nch === 2 ? '立体声' : '单声道'} / 流 ${RATE} Hz / 播放端 ${ac.sampleRate} Hz`);
+
+  const reader = res.body.getReader();
+  let carry = new Uint8Array(0);
+  const align = 2 * nch;
+  while (srcRunning) {
+    const {value, done} = await reader.read();
+    if (done) return 'ended';
+    let view = value;
+    if (carry.length) {
+      const m = new Uint8Array(carry.length + value.length);
+      m.set(carry); m.set(value, carry.length);
+      view = m; carry = new Uint8Array(0);
+    }
+    const rem = view.length % align;
+    if (rem) { carry = view.slice(view.length - rem); view = view.subarray(0, view.length - rem); }
+    bytes += view.length;
+    playChunk(view);
+  }
+  return 'stopped';
+}
+
+async function startLive() {
+  if (srcRunning) return;
+  audioCtx(); await ac.resume();
+  nextT = ac.currentTime + 0.20;
+  bytes = 0; underruns = 0; t0 = performance.now(); lastSignal = performance.now();
+  srcRunning = true; ctrl = new AbortController();
+  $('go').disabled = true; $('rec').disabled = true; $('stop').disabled = false;
+  dot.className = 'on'; stat.textContent = '连接中…';
+
+  let retry = 0, delay = 300;
+  while (srcRunning) {
+    try {
+      log(retry ? `第 ${retry} 次重连…` : '请求 /stream …');
+      const why = await runOnce();
+      if (why === 'stopped' || !srcRunning) break;
+      log('板子那头断开了');
+    } catch (e) {
+      if (e.name === 'AbortError' || !srcRunning) break;
+      log('连接出错: ' + e.message);
+    }
+    if (!srcRunning) break;
+    retry++;
+    dot.className = 'warn';
+    stat.textContent = `已断开，${delay}ms 后自动重连（第 ${retry} 次）`;
+    nextT = 0;                       // 重连后重新对齐播放时间轴
+    await sleep(delay);
+    delay = Math.min(3000, delay * 2);
+  }
+
+  srcRunning = false;
+  $('go').disabled = false; $('rec').disabled = false; $('stop').disabled = true;
+  if (dot.className !== 'warn') { dot.className = ''; stat.textContent = '已停止'; }
+}
+
+function stopLive() {
+  srcRunning = false;
+  if (ctrl) { try { ctrl.abort(); } catch (e) {} }
+  stat.textContent = '已停止'; dot.className = '';
+}
+
+/* ---------- 录一段并播放 ---------- */
+async function recordPlay() {
+  audioCtx(); await ac.resume();
+  $('rec').disabled = true; $('go').disabled = true;
+  dot.className = 'warn'; stat.textContent = '录音中…';
+  log('请求 /rec.wav?sec=3 …');
+  try {
+    const res = await fetch('/rec.wav?sec=3&t=' + Date.now(), {cache: 'no-store'});
+    const buf = await res.arrayBuffer();
+    log(`收到 ${buf.byteLength} 字节，解码播放`);
+    const ab = await ac.decodeAudioData(buf.slice(0));
+    const s = ac.createBufferSource(); s.buffer = ab; s.connect(gain); s.start();
+    stat.textContent = `录音播放中（${ab.numberOfChannels} 声道）`;
+    s.onended = () => { stat.textContent = '就绪'; dot.className = ''; };
+  } catch (e) {
+    log('录音失败: ' + e); stat.textContent = '录音失败'; dot.className = 'warn';
+  } finally {
+    $('rec').disabled = false; $('go').disabled = false;
+  }
+}
+
+setInterval(() => {
+  if (!srcRunning) return;
+  const dt = (performance.now() - t0) / 1000;
+  $('kbs').textContent = (bytes / 1024 / dt).toFixed(0);
+  $('sps').textContent = RATE;
+  if (performance.now() - lastSignal > 2000) {
+    stat.textContent = '无信号（全是数字 0）— 查麦克风接线';
+    dot.className = 'warn';
+  } else {
+    if (overWarn) {
+      stat.textContent = '输入过载 — 多半是啸叫：戴耳机或调小音箱/音量';
+      dot.className = 'warn';
+    } else {
+      stat.textContent = underruns ? `接收中（欠载 ${underruns}）` : '接收中';
+      dot.className = 'on';
+    }
+  }
+}, 500);
+
+$('go').onclick = startLive;
+$('stop').onclick = stopLive;
+$('rec').onclick = recordPlay;
+
+$('host').textContent = location.host + ' · ' + BUILD;
+fitCanvas(); draw();
+log('双麦立体声，等连接后按板子报的采样率显示');
+</script>
+</body>
+</html>
